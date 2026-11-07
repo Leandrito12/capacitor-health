@@ -1,7 +1,7 @@
 {
-  "name": "@capgo/capacitor-health",
-  "version": "8.12.0",
-  "description": "Capacitor plugin to interact with data from Apple HealthKit and Health Connect",
+  "name": "@leandrito12/capacitor-health",
+  "version": "8.12.0-ftx.1",
+  "description": "Fork of @capgo/capacitor-health adding saveWorkout (route, heart rate, distance, energy) and deleteSamples. Capacitor plugin to interact with data from Apple HealthKit and Health Connect",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
   "types": "dist/esm/index.d.ts",
@@ -19,10 +19,10 @@
   "license": "MPL-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Cap-go/capacitor-health.git"
+    "url": "git+https://github.com/Leandrito12/capacitor-health.git"
   },
   "bugs": {
-    "url": "https://github.com/Cap-go/capacitor-health/issues"
+    "url": "https://github.com/Leandrito12/capacitor-health/issues"
   },
   "homepage": "https://capgo.app/docs/plugins/health/",
   "keywords": [
