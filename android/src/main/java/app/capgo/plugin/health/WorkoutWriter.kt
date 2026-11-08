@@ -1,5 +1,6 @@
 package app.capgo.plugin.health
 
+import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
@@ -21,6 +22,10 @@ import java.time.ZoneId
 import java.time.ZoneOffset
 import java.time.format.DateTimeParseException
 import kotlin.math.roundToLong
+import kotlin.reflect.KClass
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -32,8 +37,9 @@ import org.json.JSONObject
  * so the save is atomic. Steps are never written.
  *
  * Idempotency: when the caller passes a `clientRecordId`, the session uses it and the derived
- * records use `<id>:distance`, `<id>:energy` and `<id>:hr`. Every save uses the current time as
- * `clientRecordVersion`, so a retry replaces the earlier copy instead of duplicating it.
+ * records use `<id>:distance`, `<id>:energy` and `<id>:hr`. Every save gets a higher
+ * `clientRecordVersion` than the previous one ([nextRecordVersion]), so a retry replaces the earlier
+ * copy instead of duplicating it, and derived records the new save leaves out are deleted.
  */
 class WorkoutWriter {
 
@@ -62,8 +68,8 @@ class WorkoutWriter {
      * (`startDate` inclusive, `endDate` exclusive, which is what Health Connect enforces for routes)
      * are dropped and counted instead: device clocks and GPS fix times routinely land a moment
      * outside the session, and failing the whole workout for that would lose it. Route locations
-     * that repeat an earlier timestamp are dropped too, since Health Connect requires strictly
-     * increasing route times.
+     * in the same millisecond as an earlier one are dropped too, since Health Connect stores route
+     * times in milliseconds and requires them to strictly increase.
      */
     fun parse(options: JSONObject): WorkoutInput {
         val workoutType = requiredString(options, "workoutType", "workoutType")
@@ -161,8 +167,10 @@ class WorkoutWriter {
                 )
             }
         }
-        // sortedBy is stable, so distinctBy keeps the first location given for a timestamp.
-        val route = locations.sortedBy { it.time }.distinctBy { it.time }
+        // Health Connect stores route times in milliseconds and needs them to strictly increase, so
+        // locations are deduplicated per millisecond. sortedBy is stable, so distinctBy keeps the
+        // first location given for a millisecond.
+        val route = locations.sortedBy { it.time }.distinctBy { it.time.toEpochMilli() }
         droppedRouteLocations += locations.size - route.size
 
         val pauses = mutableListOf<ExerciseSegment>()
@@ -222,8 +230,15 @@ class WorkoutWriter {
      * single types, so a missing distance / active-calories / heart-rate permission does not fail
      * the save: that record is left out and reported in `skippedRecords`. A missing route
      * permission likewise only drops the route (`routeSaved: false`).
+     *
+     * With a `clientRecordId`, the derived records this save does not write (for example a distance
+     * the caller no longer sends) are then deleted, for the types the app can write, so a
+     * replacement does not keep them from the earlier save.
      */
-    suspend fun save(client: HealthConnectClient, input: WorkoutInput): JSObject {
+    suspend fun save(client: HealthConnectClient, input: WorkoutInput): JSObject =
+        WRITE_LOCK.withLock { insert(client, input) }
+
+    private suspend fun insert(client: HealthConnectClient, input: WorkoutInput): JSObject {
         val granted = client.permissionController.getGrantedPermissions()
 
         if (EXERCISE_WRITE_PERMISSION !in granted) {
@@ -243,7 +258,7 @@ class WorkoutWriter {
         }
 
         val routeSaved = input.route.isNotEmpty() && HealthPermission.PERMISSION_WRITE_EXERCISE_ROUTE in granted
-        val version = System.currentTimeMillis()
+        val version = nextRecordVersion()
         val startZoneOffset = zoneOffset(input.startTime)
         val endZoneOffset = zoneOffset(input.endTime)
 
@@ -303,6 +318,19 @@ class WorkoutWriter {
         val platformId = response.recordIdsList.firstOrNull()
             ?: throw IllegalStateException("Health Connect did not return an id for the saved workout.")
 
+        input.clientRecordId?.let { id ->
+            val written = setOfNotNull(
+                DistanceRecord::class.takeIf { writeDistance },
+                ActiveCaloriesBurnedRecord::class.takeIf { writeEnergy },
+                HeartRateRecord::class.takeIf { writeHeartRate },
+            )
+            COMPANION_RECORDS.forEach { (recordClass, idSuffix) ->
+                if (recordClass !in written && HealthPermission.getWritePermission(recordClass) in granted) {
+                    deleteCompanionRecords(client, recordClass, listOf(companionClientRecordId(id, idSuffix)))
+                }
+            }
+        }
+
         return JSObject().apply {
             put("platformId", platformId)
             put("routeSaved", routeSaved)
@@ -313,7 +341,7 @@ class WorkoutWriter {
     }
 
     private fun metadata(input: WorkoutInput, idSuffix: String?, version: Long): Metadata {
-        val clientRecordId = input.clientRecordId?.let { id -> if (idSuffix == null) id else "$id:$idSuffix" }
+        val clientRecordId = input.clientRecordId?.let { id -> if (idSuffix == null) id else companionClientRecordId(id, idSuffix) }
         return recordMetadata(clientRecordId, input.manualEntry, version)
     }
 
@@ -386,10 +414,74 @@ class WorkoutWriter {
 
         private val PHONE_DEVICE = Device(type = Device.TYPE_PHONE)
 
-        /** Suffixes of the companion records' clientRecordIds (`<id>:distance`, ...); SampleDeleter uses them too. */
-        internal const val DISTANCE_ID_SUFFIX = "distance"
-        internal const val ENERGY_ID_SUFFIX = "energy"
-        internal const val HEART_RATE_ID_SUFFIX = "hr"
+        private const val TAG = "WorkoutWriter"
+
+        /** Suffixes of the companion records' clientRecordIds (`<id>:distance`, ...). */
+        private const val DISTANCE_ID_SUFFIX = "distance"
+        private const val ENERGY_ID_SUFFIX = "energy"
+        private const val HEART_RATE_ID_SUFFIX = "hr"
+
+        /** Records saved next to the exercise session, with their clientRecordId suffix; SampleDeleter uses them too. */
+        internal val COMPANION_RECORDS: List<Pair<KClass<out Record>, String>> = listOf(
+            DistanceRecord::class to DISTANCE_ID_SUFFIX,
+            ActiveCaloriesBurnedRecord::class to ENERGY_ID_SUFFIX,
+            HeartRateRecord::class to HEART_RATE_ID_SUFFIX,
+        )
+
+        /**
+         * Serializes saveWorkout and deleteSamples. Both make several Health Connect calls (the
+         * insert or delete, then the companion records), so a save and a delete of the same
+         * `clientRecordId` must not interleave: the delete could remove the new save's companions.
+         */
+        internal val WRITE_LOCK = Mutex()
+
+        internal fun companionClientRecordId(clientRecordId: String, idSuffix: String): String = "$clientRecordId:$idSuffix"
+
+        /**
+         * Deletes the companion records with [clientRecordIds] of [recordClass], skipping the ids that
+         * match nothing.
+         *
+         * A workout only has the companions it was saved with, and Health Connect documents that a
+         * delete fails as a whole when an id does not exist (the platform on Android 14+ ignores such
+         * ids). So when the call fails, each id is deleted on its own and a failing one is logged and
+         * skipped: the workout itself is already saved or deleted at this point.
+         */
+        internal suspend fun deleteCompanionRecords(
+            client: HealthConnectClient,
+            recordClass: KClass<out Record>,
+            clientRecordIds: List<String>,
+        ) {
+            if (clientRecordIds.isEmpty() || tryDelete(client, recordClass, clientRecordIds) || clientRecordIds.size == 1) {
+                return
+            }
+            clientRecordIds.forEach { id -> tryDelete(client, recordClass, listOf(id)) }
+        }
+
+        private suspend fun tryDelete(client: HealthConnectClient, recordClass: KClass<out Record>, clientRecordIds: List<String>): Boolean {
+            return try {
+                client.deleteRecords(recordClass, emptyList(), clientRecordIds)
+                true
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.d(TAG, "Skipped deleting ${recordClass.simpleName} $clientRecordIds (it may not exist): ${e.message}")
+                false
+            }
+        }
+
+        private var lastRecordVersion = 0L
+
+        /**
+         * `clientRecordVersion` for a save (saveWorkout and saveSample): the current time in
+         * milliseconds, but always higher than the previous version handed out, so two saves in the
+         * same millisecond, or after the clock moved back while the app runs, still replace each
+         * other. Health Connect keeps the record with the highest version.
+         */
+        @Synchronized
+        internal fun nextRecordVersion(): Long {
+            lastRecordVersion = maxOf(System.currentTimeMillis(), lastRecordVersion + 1)
+            return lastRecordVersion
+        }
 
         /**
          * Health Connect metadata for a record this plugin writes (saveWorkout and saveSample).

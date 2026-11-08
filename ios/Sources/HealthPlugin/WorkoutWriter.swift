@@ -63,8 +63,9 @@ enum HealthWriteError: LocalizedError {
 /// out and reported in `skippedRecords`; a route without share access is left out (`routeSaved: false`).
 ///
 /// Idempotency: with a `clientRecordId`, every object gets `HKMetadataKeySyncIdentifier` (the id for
-/// the workout, `<id>:distance`, `<id>:energy`, `<id>:hr:<n>` and `<id>:route` for the rest) and the
-/// save time in milliseconds as `HKMetadataKeySyncVersion`, so HealthKit replaces the earlier copy.
+/// the workout, `<id>:distance`, `<id>:energy`, `<id>:hr:<n>` and `<id>:route` for the rest) and an
+/// increasing `HKMetadataKeySyncVersion` (`SyncMetadata.currentVersion()`), so HealthKit replaces the
+/// earlier copy of each object written again.
 final class WorkoutWriter {
     private let healthStore: HKHealthStore
 
@@ -232,8 +233,16 @@ final class WorkoutWriter {
         let configuration = HKWorkoutConfiguration()
         configuration.activityType = input.workoutType.hkWorkoutActivityType()
         configuration.locationType = input.route.isEmpty ? .unknown : .outdoor
-        if input.workoutType == .swimmingPool {
+        switch input.workoutType {
+        case .swimmingPool:
             configuration.swimmingLocationType = .pool
+        case .swimmingOpenWater:
+            // The shared mapping (used by queryWorkouts filters) turns swimmingOpenWater into waterSports;
+            // HealthKit records an open-water swim as a swimming workout with an open-water location.
+            configuration.activityType = .swimming
+            configuration.swimmingLocationType = .openWater
+        default:
+            break
         }
         let builder = HKWorkoutBuilder(healthStore: healthStore, configuration: configuration, device: plan.device)
 
@@ -359,10 +368,14 @@ final class WorkoutWriter {
 
 /// Sync and recording metadata shared by `saveWorkout` and `saveSample`.
 enum SyncMetadata {
-    /// The save time in milliseconds, used as `HKMetadataKeySyncVersion`: HealthKit replaces an object
-    /// with the same `HKMetadataKeySyncIdentifier` when the new sync version is greater.
+    private static let versionCounter = SyncVersionCounter()
+
+    /// `HKMetadataKeySyncVersion` for a save: the save time in milliseconds, but always greater than the
+    /// previous version handed out, so two saves in the same millisecond, or after the clock moved back
+    /// while the app runs, still replace each other. HealthKit replaces an object with the same
+    /// `HKMetadataKeySyncIdentifier` only when the new sync version is greater.
     static func currentVersion() -> NSNumber {
-        return NSNumber(value: Int64((Date().timeIntervalSince1970 * 1000).rounded()))
+        return NSNumber(value: versionCounter.next(now: Int64((Date().timeIntervalSince1970 * 1000).rounded())))
     }
 
     static func metadata(syncIdentifier: String?, version: NSNumber, userEntered: Bool) -> [String: Any] {
@@ -392,6 +405,32 @@ enum SyncMetadata {
             )
         }
         return metadata(syncIdentifier: clientRecordId, version: currentVersion(), userEntered: recordingMethod == "manualEntry")
+    }
+
+    /// Metadata for a part of a sample saved with `forSample` metadata (the systolic and diastolic samples
+    /// of a blood pressure correlation): `<clientRecordId>:<part>` as sync identifier with the same sync
+    /// version, so saving again replaces the parts along with the correlation. Nil without a
+    /// `clientRecordId`, so the parts are saved without metadata as before.
+    static func part(_ name: String, of sampleMetadata: [String: Any]) -> [String: Any]? {
+        guard let syncIdentifier = sampleMetadata[HKMetadataKeySyncIdentifier] as? String,
+              let version = sampleMetadata[HKMetadataKeySyncVersion] as? NSNumber else {
+            return nil
+        }
+        let userEntered = sampleMetadata[HKMetadataKeyWasUserEntered] as? Bool ?? false
+        return metadata(syncIdentifier: "\(syncIdentifier):\(name)", version: version, userEntered: userEntered)
+    }
+}
+
+/// Hands out strictly increasing sync versions. Thread-safe, since plugin calls can run on different threads.
+private final class SyncVersionCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: Int64 = 0
+
+    func next(now: Int64) -> Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        last = max(now, last + 1)
+        return last
     }
 }
 
@@ -467,7 +506,7 @@ extension WorkoutWriter {
 ///
 /// Invalid values throw `HealthWriteError.invalidOption` naming the field. Heart-rate readings and
 /// route locations outside the workout (`startDate` inclusive, `endDate` exclusive), and route
-/// locations repeating an earlier timestamp, are dropped and counted instead of failing the workout.
+/// locations in the same millisecond as an earlier one, are dropped and counted instead of failing the workout.
 struct WorkoutInput {
     struct HeartRateReading {
         let date: Date
@@ -581,12 +620,21 @@ struct WorkoutInput {
                 inWorkout.append(location)
             }
         }
-        // Keep the first location given for a timestamp, like Android (Health Connect needs increasing times).
+        // Keep the first location given for a millisecond, like Android (Health Connect stores route times in
+        // milliseconds and needs them to increase).
         var unique: [CLLocation] = []
-        for location in sortedByDate(inWorkout, { $0.timestamp }) where unique.last?.timestamp != location.timestamp {
+        for location in sortedByDate(inWorkout, { $0.timestamp }) {
+            if let previous = unique.last, epochMilliseconds(previous.timestamp) == epochMilliseconds(location.timestamp) {
+                continue
+            }
             unique.append(location)
         }
         return (unique, items.count - unique.count)
+    }
+
+    /// Whole milliseconds since 1970, rounded down like Java's `Instant.toEpochMilli()`.
+    private static func epochMilliseconds(_ date: Date) -> Int64 {
+        return Int64((date.timeIntervalSince1970 * 1000).rounded(.down))
     }
 
     private static func parseLocation(_ value: JSValue, path: String) throws -> CLLocation {

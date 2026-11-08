@@ -1254,8 +1254,7 @@ final class Health {
         }
     }
 
-    /// Calls back with the saved object's UUID (the correlation's for blood pressure).
-    func saveSample(dataTypeIdentifier: String, value: Double, unitIdentifier: String?, startDateString: String?, endDateString: String?, metadata: [String: String]?, systolic: Double?, diastolic: Double?, clientRecordId: String?, recordingMethod: String?, completion: @escaping (Result<String, Error>) -> Void) throws {
+    func saveSample(dataTypeIdentifier: String, value: Double, unitIdentifier: String?, startDateString: String?, endDateString: String?, metadata: [String: String]?, systolic: Double?, diastolic: Double?, clientRecordId: String?, recordingMethod: String?, completion: @escaping (Result<Void, Error>) -> Void) throws {
         guard HKHealthStore.isHealthDataAvailable() else {
             throw HealthManagerError.healthDataUnavailable
         }
@@ -1298,7 +1297,7 @@ final class Health {
                 }
                 
                 if success {
-                    completion(.success(sample.uuid.uuidString))
+                    completion(.success(()))
                 } else {
                     completion(.failure(HealthManagerError.operationFailed("Failed to save the sample.")))
                 }
@@ -1320,7 +1319,7 @@ final class Health {
                 }
                 
                 if success {
-                    completion(.success(sample.uuid.uuidString))
+                    completion(.success(()))
                 } else {
                     completion(.failure(HealthManagerError.operationFailed("Failed to save the sample.")))
                 }
@@ -1343,8 +1342,11 @@ final class Health {
             let systolicQuantity = HKQuantity(unit: HKUnit.millimeterOfMercury(), doubleValue: systolicValue)
             let diastolicQuantity = HKQuantity(unit: HKUnit.millimeterOfMercury(), doubleValue: diastolicValue)
             
-            let systolicSample = HKQuantitySample(type: systolicType, quantity: systolicQuantity, start: startDate, end: endDate)
-            let diastolicSample = HKQuantitySample(type: diastolicType, quantity: diastolicQuantity, start: startDate, end: endDate)
+            // With a clientRecordId the two samples get derived sync identifiers too (see SyncMetadata.part)
+            let systolicSample = HKQuantitySample(type: systolicType, quantity: systolicQuantity, start: startDate, end: endDate,
+                                                  metadata: SyncMetadata.part("systolic", of: syncMetadata))
+            let diastolicSample = HKQuantitySample(type: diastolicType, quantity: diastolicQuantity, start: startDate, end: endDate,
+                                                   metadata: SyncMetadata.part("diastolic", of: syncMetadata))
             
             let correlation = HKCorrelation(type: correlationType, start: startDate, end: endDate, objects: [systolicSample, diastolicSample], metadata: metadataDictionary)
             
@@ -1353,9 +1355,9 @@ final class Health {
                     completion(.failure(error))
                     return
                 }
-
+                
                 if success {
-                    completion(.success(correlation.uuid.uuidString))
+                    completion(.success(()))
                 } else {
                     completion(.failure(HealthManagerError.operationFailed("Failed to save the sample.")))
                 }
@@ -1376,7 +1378,7 @@ final class Health {
             }
 
             if success {
-                completion(.success(sample.uuid.uuidString))
+                completion(.success(()))
             } else {
                 completion(.failure(HealthManagerError.operationFailed("Failed to save the sample.")))
             }
