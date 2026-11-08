@@ -1,6 +1,6 @@
 {
   "name": "@leandrito12/capacitor-health",
-  "version": "8.12.0-ftx.1",
+  "version": "8.12.0-ftx.2",
   "description": "Fork of @capgo/capacitor-health adding saveWorkout (route, heart rate, distance, energy) and deleteSamples. Capacitor plugin to interact with data from Apple HealthKit and Health Connect",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
